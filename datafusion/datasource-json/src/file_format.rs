@@ -56,6 +56,7 @@ use datafusion_datasource::write::orchestration::spawn_writer_tasks_and_join;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr_common::sort_expr::LexRequirement;
+use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_session::Session;
 
@@ -420,6 +421,8 @@ pub struct JsonSink {
     config: FileSinkConfig,
     /// Writer options for underlying Json writer
     writer_options: JsonWriterOptions,
+    /// Metrics for tracking write operations
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl Debug for JsonSink {
@@ -450,6 +453,7 @@ impl JsonSink {
         Self {
             config,
             writer_options,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -472,8 +476,14 @@ impl FileSink for JsonSink {
         file_stream_rx: DemuxedStreamReceiver,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<u64> {
+        let rows_written = MetricBuilder::new(&self.metrics).global_counter("rows_written");
+        let bytes_written =
+            MetricBuilder::new(&self.metrics).global_counter("bytes_written");
+        let elapsed_compute = MetricBuilder::new(&self.metrics).elapsed_compute(0);
+        let write_start = datafusion_common::instant::Instant::now();
+
         let serializer = Arc::new(JsonSerializer::new()) as _;
-        spawn_writer_tasks_and_join(
+        let result = spawn_writer_tasks_and_join(
             context,
             serializer,
             self.writer_options.compression.into(),
@@ -481,8 +491,13 @@ impl FileSink for JsonSink {
             object_store,
             demux_task,
             file_stream_rx,
+            Some(&rows_written),
+            Some(&bytes_written),
         )
-        .await
+        .await;
+
+        elapsed_compute.add_elapsed(write_start);
+        result
     }
 }
 
@@ -490,6 +505,10 @@ impl FileSink for JsonSink {
 impl DataSink for JsonSink {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn schema(&self) -> &SchemaRef {

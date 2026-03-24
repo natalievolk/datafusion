@@ -32,6 +32,7 @@ use datafusion_common::{
 };
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_execution::TaskContext;
+use datafusion_physical_plan::metrics::Count;
 
 use bytes::Bytes;
 use futures::join;
@@ -50,6 +51,9 @@ pub(crate) enum SerializedRecordBatchResult {
 
         /// the number of rows successfully written
         row_count: usize,
+
+        /// the number of bytes written to the object store
+        bytes_written: usize,
     },
     Failure {
         /// As explained in [`serialize_rb_stream_to_object_store`]:
@@ -64,8 +68,12 @@ pub(crate) enum SerializedRecordBatchResult {
 
 impl SerializedRecordBatchResult {
     /// Create the success variant
-    pub fn success(writer: WriterType, row_count: usize) -> Self {
-        Self::Success { writer, row_count }
+    pub fn success(writer: WriterType, row_count: usize, bytes_written: usize) -> Self {
+        Self::Success {
+            writer,
+            row_count,
+            bytes_written,
+        }
     }
 
     pub fn failure(writer: Option<WriterType>, err: DataFusionError) -> Self {
@@ -111,9 +119,11 @@ pub(crate) async fn serialize_rb_stream_to_object_store(
     });
 
     let mut row_count = 0;
+    let mut bytes_written = 0;
     while let Some(task) = rx.recv().await {
         match task.join().await {
             Ok(Ok((cnt, bytes))) => {
+                let byte_len = bytes.len();
                 match writer.write_all(&bytes).await {
                     Ok(_) => (),
                     Err(e) => {
@@ -124,6 +134,7 @@ pub(crate) async fn serialize_rb_stream_to_object_store(
                     }
                 };
                 row_count += cnt;
+                bytes_written += byte_len;
             }
             Ok(Err(e)) => {
                 // Return the writer along with the error
@@ -151,7 +162,7 @@ pub(crate) async fn serialize_rb_stream_to_object_store(
             );
         }
     }
-    SerializedRecordBatchResult::success(writer, row_count)
+    SerializedRecordBatchResult::success(writer, row_count, bytes_written)
 }
 
 type FileWriteBundle = (Receiver<RecordBatch>, SerializerType, WriterType);
@@ -162,9 +173,10 @@ type FileWriteBundle = (Receiver<RecordBatch>, SerializerType, WriterType);
 /// dependency on the RecordBatches before or after.
 pub(crate) async fn stateless_serialize_and_write_files(
     mut rx: Receiver<FileWriteBundle>,
-    tx: tokio::sync::oneshot::Sender<u64>,
+    tx: tokio::sync::oneshot::Sender<(u64, u64)>,
 ) -> Result<()> {
     let mut row_count = 0;
+    let mut bytes_count = 0;
     // tracks if any writers encountered an error triggering the need to abort
     let mut any_errors = false;
     // tracks the specific error triggering abort
@@ -185,9 +197,11 @@ pub(crate) async fn stateless_serialize_and_write_files(
                 SerializedRecordBatchResult::Success {
                     writer,
                     row_count: cnt,
+                    bytes_written,
                 } => {
                     finished_writers.push(writer);
                     row_count += cnt;
+                    bytes_count += bytes_written;
                 }
                 SerializedRecordBatchResult::Failure { writer, err } => {
                     finished_writers.extend(writer);
@@ -233,7 +247,7 @@ pub(crate) async fn stateless_serialize_and_write_files(
         }
     }
 
-    tx.send(row_count as u64).map_err(|_| {
+    tx.send((row_count as u64, bytes_count as u64)).map_err(|_| {
         internal_datafusion_err!(
             "Error encountered while sending row count back to file sink!"
         )
@@ -244,6 +258,9 @@ pub(crate) async fn stateless_serialize_and_write_files(
 /// Orchestrates multipart put of a dynamic number of output files from a single input stream
 /// for any statelessly serialized file type. That is, any file type for which each [RecordBatch]
 /// can be serialized independently of all other [RecordBatch]s.
+///
+/// If `rows_written` and `bytes_written` counters are provided, they will be updated with
+/// the total rows and bytes written across all output files.
 pub async fn spawn_writer_tasks_and_join(
     context: &Arc<TaskContext>,
     serializer: Arc<dyn BatchSerializer>,
@@ -252,6 +269,8 @@ pub async fn spawn_writer_tasks_and_join(
     object_store: Arc<dyn ObjectStore>,
     demux_task: SpawnedTask<Result<()>>,
     mut file_stream_rx: DemuxedStreamReceiver,
+    rows_written: Option<&Count>,
+    bytes_written: Option<&Count>,
 ) -> Result<u64> {
     let rb_buffer_size = &context
         .session_config()
@@ -298,8 +317,15 @@ pub async fn spawn_writer_tasks_and_join(
     r1.map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
     r2.map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))??;
 
-    // Return total row count:
-    rx_row_cnt.await.map_err(|_| {
+    // Return total row count and update optional metric counters:
+    let (rows, bytes) = rx_row_cnt.await.map_err(|_| {
         internal_datafusion_err!("Did not receive row count from write coordinator")
-    })
+    })?;
+    if let Some(counter) = rows_written {
+        counter.add(rows as usize);
+    }
+    if let Some(counter) = bytes_written {
+        counter.add(bytes as usize);
+    }
+    Ok(rows)
 }

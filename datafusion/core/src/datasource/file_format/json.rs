@@ -634,4 +634,80 @@ mod tests {
         assert_eq!(2, batches[0].num_rows());
         Ok(())
     }
+
+    /// Test that JsonSink exposes rows_written, bytes_written, and
+    /// elapsed_compute metrics via DataSinkExec.
+    #[tokio::test]
+    async fn test_json_sink_metrics() -> Result<()> {
+        use arrow::array::Int32Array;
+        use arrow_schema::{DataType, Field};
+        use datafusion_execution::TaskContext;
+        use futures::TryStreamExt;
+
+        let ctx = SessionContext::new();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let output_path = tmp_dir.path().join("metrics_test.json");
+        let output_path_str = output_path.to_str().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let ids: Vec<i32> = (0..100).collect();
+        let vals: Vec<i32> = (100..200).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(vals)),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("source", batch).unwrap();
+
+        let df = ctx
+            .sql(&format!(
+                "COPY source TO '{output_path_str}' STORED AS JSON"
+            ))
+            .await?;
+        let plan = df.create_physical_plan().await?;
+
+        let task_ctx = Arc::new(TaskContext::from(&ctx.state()));
+        let stream = plan.execute(0, task_ctx)?;
+        let _batches: Vec<_> = stream.try_collect().await?;
+
+        let metrics = plan
+            .metrics()
+            .expect("DataSinkExec should return metrics from JsonSink");
+        let aggregated = metrics.aggregate_by_name();
+
+        let rows_written = aggregated
+            .iter()
+            .find(|m| m.value().name() == "rows_written")
+            .expect("should have rows_written metric")
+            .value()
+            .as_usize();
+        assert_eq!(rows_written, 100, "expected 100 rows written");
+
+        let bytes_written = aggregated
+            .iter()
+            .find(|m| m.value().name() == "bytes_written")
+            .expect("should have bytes_written metric")
+            .value()
+            .as_usize();
+        assert!(
+            bytes_written > 0,
+            "expected bytes_written > 0, got {bytes_written}"
+        );
+
+        let elapsed = aggregated
+            .iter()
+            .find(|m| m.value().name() == "elapsed_compute")
+            .expect("should have elapsed_compute metric")
+            .value()
+            .as_usize();
+        assert!(elapsed > 0, "expected elapsed_compute > 0");
+
+        Ok(())
+    }
 }
